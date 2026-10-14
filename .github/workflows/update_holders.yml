@@ -1,0 +1,27 @@
+name: update-holders
+
+on:
+  schedule:
+    - cron: "0 1 * * 6"   # 每週六 01:00 UTC（台灣時間 09:00），此時集保本週資料已發布
+  workflow_dispatch:       # 也可在 GitHub 的 Actions 頁面手動執行
+
+permissions:
+  contents: write          # 允許把更新後的 CSV 提交回 repo
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pandas requests
+      - run: python update_holders.py
+      - name: Commit updated CSV
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add holders_history.csv
+          git diff --cached --quiet || git commit -m "update holders $(date -u +%F)"
+          git push
