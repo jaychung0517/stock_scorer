@@ -1,12 +1,12 @@
 """
-個股多面向評分與批次快篩工具（台股進階版，Streamlit）
-功能亮點：
-1. 支援批次輸入代碼 / 常用預設群組（如台灣50精選、高股息等）
-2. 批次計算總分、三大面向分數與即時買點訊號，生成排行清單
-3. 點選清單中個股，即時載入完整多面向明細、目標價、K線與歷史勝率回測
+個股多面向評分與批次快篩工具（含股票名稱對照版，Streamlit）
+升級重點：
+1. 自動調用 FinMind TaiwanStockInfo，為個股代碼補上正式中文股票名稱
+2. 批次總覽排行、下拉選單、詳細報告標題全數同步顯示「代碼 + 名稱」
+3. 保留 ROE、大戶持股集中度與歷史勝率回測
 
 安裝：pip install streamlit pandas numpy requests plotly
-執行：streamlit run stock_batch_scorer.py
+執行：streamlit run stock_batch_scorer_v3.py
 """
 import datetime as dt
 import time
@@ -28,6 +28,22 @@ STOCK_POOLS = {
 
 
 # ───────────────────────── 資料擷取 ─────────────────────────
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_stock_info(token: str = "") -> dict:
+    """快取全台股代碼與名稱對照表（快取 24 小時）"""
+    params = {"dataset": "TaiwanStockInfo"}
+    if token:
+        params["token"] = token
+    try:
+        r = requests.get(API, params=params, timeout=30)
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            return {item["stock_id"]: item.get("stock_name", "") for item in data}
+    except Exception:
+        pass
+    return {}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch(dataset: str, stock_id: str, days: int, token: str = "") -> pd.DataFrame:
     start = (dt.date.today() - dt.timedelta(days=days)).isoformat()
@@ -70,7 +86,7 @@ def combine(items):
 def score_fundamental(rev, fin, per):
     items, eps_ttm, fair_pe = [], None, None
 
-    # 1. 營收
+    # 1. 營收年增率
     s, v = None, "資料不足"
     if len(rev) >= 15:
         r = rev.sort_values("date")["revenue"].astype(float).values
@@ -235,14 +251,14 @@ def verdict(total, f_score, x):
     extended = c / x["ma20"] - 1 > 0.08 or x["rsi"] > 70
     pullback = x["ma60"] * 0.98 <= c <= x["ma20"] * 1.02
     if f_score is not None and f_score >= 65 and pullback and total >= 55:
-        return "success", "🟢 回測支撐買點"
+        return "🟢 回測支撐買點"
     if total >= 70 and not extended:
-        return "success", "🟢 分批佈局區"
+        return "🟢 分批佈局區"
     if total >= 70:
-        return "warning", "🟡 短線過熱等拉回"
+        return "🟡 短線過熱等拉回"
     if total >= 50:
-        return "warning", "🟡 中性觀望"
-    return "error", "🔴 偏弱觀望"
+        return "🟡 中性觀望"
+    return "🔴 偏弱觀望"
 
 
 def targets(p, eps_ttm, fair_pe):
@@ -291,7 +307,7 @@ def run_backtest(p, buy_threshold=70, hold_days=20):
 
 
 # ───────────────────────── 單股分析計算打包 ─────────────────────────
-def calculate_stock_profile(code, token):
+def calculate_stock_profile(code, stock_name, token):
     price = get_dataset_safe("TaiwanStockPrice", code, 550, token)
     if len(price) < 80:
         return None
@@ -311,12 +327,14 @@ def calculate_stock_profile(code, token):
     scores = {"基本面": f_score, "籌碼面": c_score, "技術面": t_score}
     total, _ = combine([(k, "", s, W_DIM[k]) for k, s in scores.items()])
 
-    _, v_text = verdict(total if total else 0, f_score, x)
+    v_text = verdict(total if total else 0, f_score, x)
     tg, stop = targets(p, eps_ttm, fair_pe)
     mid_target = float(np.mean(list(tg.values()))) if tg else np.nan
 
     return {
         "code": code,
+        "name": stock_name,
+        "display_name": f"{code} {stock_name}".strip(),
         "close": x["close"],
         "total": round(total) if total else 0,
         "f_score": round(f_score) if f_score else 0,
@@ -340,8 +358,11 @@ def main():
     st.set_page_config(page_title="台股多面向批次評分與快篩", page_icon="📈", layout="wide")
     st.title("📈 台股多面向批次評分與快篩系統")
 
-    # 側邊欄設定
     token = st.sidebar.text_input("FinMind Token（選填，填入提高限額）", type="password")
+
+    # 取得名稱對照字典
+    info_map = fetch_stock_info(token)
+
     pool_choice = st.sidebar.selectbox("快速選取股票池範本", ["自訂輸入"] + list(STOCK_POOLS.keys()))
 
     if pool_choice != "自訂輸入":
@@ -352,11 +373,9 @@ def main():
     raw_input = st.sidebar.text_area("股票代碼清單（逗號、空白或換行分隔）", default_codes, height=120)
     batch_btn = st.sidebar.button("🚀 開始批次評分掃描", type="primary")
 
-    # 解析輸入代碼
     codes = [c.strip() for c in raw_input.replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
-    codes = list(dict.fromkeys(codes))  # 去除重複
+    codes = list(dict.fromkeys(codes))
 
-    # 初始化 session state 暫存批次分析結果
     if "batch_results" not in st.session_state:
         st.session_state["batch_results"] = {}
 
@@ -366,15 +385,15 @@ def main():
         status_box = st.empty()
 
         for idx, code in enumerate(codes):
-            status_box.text(f"正在掃描分析：{code} ({idx+1}/{len(codes)}) ...")
+            s_name = info_map.get(code, "")
+            status_box.text(f"正在掃描分析：{code} {s_name} ({idx+1}/{len(codes)}) ...")
             try:
-                res = calculate_stock_profile(code, token)
+                res = calculate_stock_profile(code, s_name, token)
                 if res:
                     st.session_state["batch_results"][code] = res
             except Exception as e:
                 st.warning(f"標的 {code} 擷取失敗：{e}")
             progress_bar.progress((idx + 1) / len(codes))
-            # 避免無 token 時觸發每分鐘 rate limit
             if not token:
                 time.sleep(0.3)
 
@@ -384,26 +403,27 @@ def main():
     results = st.session_state["batch_results"]
 
     if results:
-        # 整理排行表格
+        # 排行榜
         summary_rows = []
         for c, data in results.items():
             upside = (data["target"] / data["close"] - 1) * 100 if pd.notna(data["target"]) else None
             summary_rows.append({
-                "代碼": c,
+                "代碼": data["code"],
+                "股名": data["name"] if data["name"] else "—",
                 "現價": data["close"],
                 "總分": data["total"],
                 "基本面": data["f_score"],
                 "籌碼面": data["c_score"],
                 "技術面": data["t_score"],
                 "目標價": round(data["target"], 1) if pd.notna(data["target"]) else "N/A",
-                "潛在上漲空間": f"{upside:+.1f}%" if upside is not None else "N/A",
-                "狀態訊號": data["verdict"],
+                "潛在空間": f"{upside:+.1f}%" if upside is not None else "N/A",
+                "買點訊號": data["verdict"],
             })
 
         summary_df = pd.DataFrame(summary_rows).sort_values("總分", ascending=False).reset_index(drop=True)
 
         st.subheader("📋 批次評分排行榜（依總分排序）")
-        st.caption("提示：可檢視評分較高或標註『🟢 回測支撐買點』之個股，並在下方深入檢視完整面向與歷史勝率。")
+        st.caption("提示：可鎖定高分或標註『🟢』訊號之個股，於下方選取進行深度診斷與回測。")
         st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
         st.write("---")
@@ -412,7 +432,7 @@ def main():
         selected_code = st.selectbox(
             "選擇要深入檢視的個股：",
             options=summary_df["代碼"].tolist(),
-            format_func=lambda x: f"{x} - 總分 {results[x]['total']} 分（{results[x]['verdict']}）"
+            format_func=lambda x: f"{results[x]['display_name']} - 總分 {results[x]['total']} 分（{results[x]['verdict']}）"
         )
 
         if selected_code and selected_code in results:
@@ -421,6 +441,7 @@ def main():
             x = p.iloc[-1]
 
             # 頂部儀表板
+            st.markdown(f"### 🏢 {d['display_name']}　現價：**{x['close']:.2f} 元**")
             m0, m1, m2, m3 = st.columns(4)
             m0.metric("目前總分", f"{d['total']} 分")
             m1.metric("基本面得分 (35%)", f"{d['f_score']} 分")
@@ -429,18 +450,18 @@ def main():
 
             # 買點與目標價
             c1, c2, c3 = st.columns(3)
-            c1.metric("收盤價", f"{x['close']:.2f} 元")
+            c1.metric("最新收盤價", f"{x['close']:.2f} 元")
             upside_val = (d["target"] / x["close"] - 1) * 100 if pd.notna(d["target"]) else None
             c2.metric("綜合目標價", f"{d['target']:.1f} 元" if pd.notna(d["target"]) else "N/A", f"{upside_val:+.1f}%" if upside_val else None)
             c3.metric("動態停損參考", f"{d['stop']:.1f} 元", f"{(d['stop'] / x['close'] - 1) * 100:+.1f}%")
 
-            # 面向明細分頁
+            # 分頁
             t1, t2, t3, t4, t5 = st.tabs(["基本面明細", "籌碼面明細", "技術面明細", "K線型態", "🎯 該股歷史勝率回測"])
             t1.dataframe(pd.DataFrame(d["f_rows"]), hide_index=True, use_container_width=True)
             t2.dataframe(pd.DataFrame(d["c_rows"]), hide_index=True, use_container_width=True)
             t3.dataframe(pd.DataFrame(d["t_rows"]), hide_index=True, use_container_width=True)
 
-            # 繪製 K 線
+            # K 線圖
             q = p.tail(180)
             dates = pd.to_datetime(q["date"])
             fig = go.Figure(go.Candlestick(x=dates, open=q["open"], high=q["max"], low=q["min"], close=q["close"], name="K線"))
@@ -451,7 +472,7 @@ def main():
 
             # 回測面板
             with t5:
-                st.write(f"##### {selected_code} 過去買點訊號前向持有勝率檢驗")
+                st.write(f"##### {d['display_name']} 歷史訊號持有期勝率檢驗")
                 col_b1, col_b2 = st.columns(2)
                 th = col_b1.slider("回測進場分數門檻", 60, 85, 70, 5, key=f"th_{selected_code}")
                 h_days = col_b2.selectbox("進場後持有交易日數", [10, 20, 60], index=1, key=f"hd_{selected_code}")
