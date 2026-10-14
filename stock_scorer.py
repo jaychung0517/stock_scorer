@@ -580,7 +580,7 @@ def render_backtest(ok_results):
         if sub.empty:
             return
     base = sub[col].mean()
-    ic = sub["總分"].corr(sub[col], method="spearman")
+    ic = sub["總分"].rank().corr(sub[col].rank())  # 等同 Spearman，且不需要 scipy
     sub["分組"] = pd.qcut(sub["總分"].rank(method="first"), 3, labels=["低分組", "中分組", "高分組"])
     t_score = group_table(sub, "分組", col, base)
     spread = t_score.loc["高分組", "平均報酬"] - t_score.loc["低分組", "平均報酬"]
