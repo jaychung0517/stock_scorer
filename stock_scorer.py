@@ -12,8 +12,13 @@
 5. 其他：股名快取失敗不再被鎖 24 小時、支援全形逗號、偵測 FinMind 限流、
    目標價分開顯示並補回風險報酬比、相容新舊版 Streamlit 的寬度參數
 
+v5 新增：
+6. 量價型態快篩：爆量（今日量 ≥ 昨量／5日均量／60日均量的 N 倍）＋近期出現破底翻／創20日新高／創歷史新高，
+   只用股價資料（每檔 1 次 API），可把通過的股票一鍵放進左側清單再做完整評分
+7. 最近 5 次輸入的清單記錄（只存在本次連線；重新整理網頁會清空）
+
 安裝：pip install streamlit pandas numpy requests plotly
-執行：streamlit run stock_batch_scorer_v4.py
+執行：streamlit run stock_batch_scorer_v5.py
 """
 import datetime as dt
 import io
@@ -502,6 +507,121 @@ def show_table(df):
     st.dataframe(show.reset_index(), hide_index=True, **STRETCH)
 
 
+# ───────────────────────── 量價型態快篩（只用股價資料，每檔 1 次 API）─────────────────────────
+VOL_BASES = ["昨量", "5日均量", "60日均量"]
+PATTERNS = ["破底翻", "創20日新高", "創歷史新高"]
+
+
+def parse_codes(raw: str) -> list:
+    return list(dict.fromkeys(c for c in re.split(r"[,\s，、;；]+", raw or "") if c))
+
+
+def remember_codes(codes):
+    """記錄最近 5 次輸入的清單（只存在這次連線的 session，重新整理網頁就會清空）"""
+    if not codes:
+        return
+    s = ", ".join(codes)
+    lst = [x for x in st.session_state.get("recent_lists", []) if x != s]
+    st.session_state["recent_lists"] = ([s] + lst)[:5]
+
+
+def remember_current():  # 當按鈕的 on_click：在畫面重繪前先更新，下拉選單才會立刻出現新紀錄
+    remember_codes(parse_codes(st.session_state.get("codes_text", "")))
+
+
+def apply_pool():
+    p = st.session_state.get("pool_choice")
+    if p in STOCK_POOLS:
+        st.session_state["codes_text"] = ", ".join(STOCK_POOLS[p])
+
+
+def apply_recent():
+    r = st.session_state.get("recent_choice")
+    if r and r != "—":
+        st.session_state["codes_text"] = r
+    st.session_state["recent_choice"] = "—"
+
+
+def set_codes(codes):
+    st.session_state["codes_text"] = ", ".join(codes)
+
+
+def volume_ratio_table(p):
+    """每日成交量 ÷ 基準；基準皆『不含當日』：前一日量、前5日均量、前60日均量"""
+    v = p["Trading_Volume"].astype(float).reset_index(drop=True)
+    prev = v.shift(1)
+    return pd.DataFrame({
+        "昨量": v / prev.replace(0, np.nan),
+        "5日均量": v / prev.rolling(5).mean().replace(0, np.nan),
+        "60日均量": v / prev.rolling(60).mean().replace(0, np.nan),
+    })
+
+
+def detect_spring(p, lookback=5, window=60, k=5):
+    """破底翻：收盤跌破『前 window 日最低價』後，k 日內收盤站回該前低之上，
+    站回日在近 lookback 日內，且最新收盤仍在前低之上"""
+    close = p["close"].astype(float).values
+    low = p["min"].astype(float).values
+    n = len(close)
+    support = pd.Series(low).shift(1).rolling(window).min().values
+    for b in range(n - 2, max(window, n - 1 - lookback - k) - 1, -1):
+        if not close[b] < support[b]:  # support 為 NaN 時比較為 False
+            continue
+        ref = support[b]
+        for d in range(b + 1, min(b + k, n - 1) + 1):
+            if close[d] > ref:
+                if d >= n - lookback and close[n - 1] > ref:
+                    return {"ref": float(ref), "b": p["date"].iloc[b], "d": p["date"].iloc[d]}
+                break
+    return None
+
+
+def detect_patterns(p, selected, lookback=5, window=60):
+    c = p["close"].astype(float).reset_index(drop=True)
+    dates = p["date"].reset_index(drop=True)
+    n = len(c)
+    found = {}
+
+    def last_true(mask):
+        idx = [i for i in range(max(0, n - lookback), n) if bool(mask.iloc[i])]
+        return dates.iloc[idx[-1]] if idx else None
+
+    if "創20日新高" in selected:
+        d = last_true(c >= c.rolling(20).max())
+        if d:
+            found["創20日新高"] = f"創20日新高（{d[5:]}）"
+    if "創歷史新高" in selected and n >= 250:  # 以抓到的約 5 年資料為準，且為未還原權值價格
+        d = last_true(c >= c.cummax())
+        if d:
+            found["創歷史新高"] = f"創資料期間新高（{d[5:]}）"
+    if "破底翻" in selected and n > window + 10:
+        s = detect_spring(p, lookback, window)
+        if s:
+            found["破底翻"] = f"破底翻（前{window}日低 {s['ref']:.1f}，{s['b'][5:]}跌破→{s['d'][5:]}站回）"
+    return found
+
+
+def screen_stock(p, bases, mult, patterns, lookback, window, relax_volume):
+    """條件：(任一量能基準 ≥ mult 倍) 且 (任一選定型態在近 lookback 日內出現)"""
+    if len(p) < 70:
+        return None
+    ratios = volume_ratio_table(p)
+    win = ratios.tail(lookback if relax_volume else 1)
+    hits = {}
+    for b in bases:
+        col = win[b].dropna()
+        if not col.empty and col.max() >= mult:
+            hits[b] = float(col.max())
+    pats = detect_patterns(p, patterns, lookback, window)
+    last = ratios.iloc[-1]
+    c = p["close"].astype(float)
+    return {
+        "close": float(c.iloc[-1]), "chg": float(c.iloc[-1] / c.iloc[-2] - 1),
+        "r_prev": last["昨量"], "r_5": last["5日均量"], "r_60": last["60日均量"],
+        "vol_hits": hits, "patterns": pats, "passed": bool(hits) and bool(pats),
+    }
+
+
 # ───────────────────────── 畫面 ─────────────────────────
 def render_detail(d):
     p = d["p_df"]
@@ -608,20 +728,99 @@ def render_backtest(ok_results):
     )
 
 
+def render_screener(codes, token, info_map):
+    st.subheader("🔎 量價型態快篩")
+    st.caption(
+        "只用股價資料（每檔 1 次 API），從左側清單中篩出「爆量 ＋ 近期出現指定型態」的股票。"
+        "量能基準皆不含當日；型態以收盤價判斷。『歷史新高』以抓到的約 5 年資料為準，價格未還原除權息。"
+    )
+    c1, c2 = st.columns(2)
+    bases = c1.multiselect("量能基準（任一成立）", VOL_BASES, default=VOL_BASES)
+    mult = c2.number_input("爆量倍數（今日量 ÷ 基準 ≥）", min_value=1.0, max_value=10.0, value=2.0, step=0.5)
+    pats = st.multiselect("型態（任一成立）", PATTERNS, default=PATTERNS)
+    c3, c4, c5 = st.columns(3)
+    lookback = c3.slider("型態需出現在近 N 個交易日內", 1, 20, 5)
+    window = c4.selectbox("破底翻：跌破的前低視窗（日）", [20, 60], index=1)
+    relax = c5.checkbox("量能也放寬到近 N 日內任一天", value=False)
+
+    if st.button("開始快篩", type="primary", on_click=remember_current):
+        if not codes or not bases or not pats:
+            st.warning("請先在左側輸入股票代碼，並至少選一個量能基準與一個型態。")
+        else:
+            rows, bar, box = [], st.progress(0), st.empty()
+            for i, code in enumerate(codes):
+                box.text(f"快篩中：{code} {info_map.get(code, '')} ({i + 1}/{len(codes)})")
+                price, status = safe_get("price", code, token)
+                if is_rate_limited({"price": status}):
+                    st.error("偵測到 FinMind 呼叫上限，後續標的未掃描。請稍後再試，或減少標的數量。")
+                    break
+                if len(price) >= 70:
+                    try:
+                        r = screen_stock(price, bases, mult, pats, lookback, window, relax)
+                    except Exception as e:
+                        r = None
+                        st.warning(f"{code} 計算失敗：{str(e)[:60]}")
+                    if r:
+                        r.update({"code": code, "name": info_map.get(code, "")})
+                        rows.append(r)
+                bar.progress((i + 1) / len(codes))
+                time.sleep(0.2)
+            box.empty()
+            bar.empty()
+            st.session_state["screen_rows"] = rows
+
+    rows = st.session_state.get("screen_rows")
+    if rows is None:
+        return
+    if not rows:
+        st.info("沒有可用的資料（資料不足 70 個交易日或被限流）。")
+        return
+    df = pd.DataFrame([{
+        "通過": "✅" if r["passed"] else "",
+        "代碼": r["code"], "股名": r["name"] or "—", "收盤": r["close"], "漲跌幅": f"{r['chg']:+.1%}",
+        "量比(昨量)": r["r_prev"], "量比(5日均)": r["r_5"], "量比(60日均)": r["r_60"],
+        "達標量能": "、".join(r["vol_hits"]) or "—",
+        "型態": "；".join(r["patterns"].values()) or "—",
+        "_s": r["r_5"] if pd.notna(r["r_5"]) else 0,
+    } for r in rows])
+    df = df.sort_values(["通過", "_s"], ascending=[False, False]).drop(columns="_s")
+    passed = df[df["通過"] == "✅"]["代碼"].tolist()
+    st.markdown(f"**通過 {len(passed)} 檔 ／ 共掃描 {len(df)} 檔**")
+    only = st.checkbox("只顯示通過者", value=True)
+    show = df[df["通過"] == "✅"] if only else df
+    st.dataframe(
+        show, hide_index=True, **STRETCH,
+        column_config={
+            "收盤": st.column_config.NumberColumn(format="%.2f"),
+            "量比(昨量)": st.column_config.NumberColumn(format="%.1f"),
+            "量比(5日均)": st.column_config.NumberColumn(format="%.1f"),
+            "量比(60日均)": st.column_config.NumberColumn(format="%.1f"),
+        },
+    )
+    if passed:
+        st.button("📥 把通過的股票放進左側清單（再做完整評分）", on_click=set_codes, args=(passed,))
+
+
 def main():
     st.set_page_config(page_title="台股多面向批次評分與回測", page_icon="📈", layout="wide")
     st.title("📈 台股多面向批次評分、快篩與回測")
 
     token = st.sidebar.text_input("FinMind Token（選填，填入提高限額）", type="password")
     info_map = fetch_stock_info(token)
-    pool_choice = st.sidebar.selectbox("快速選取股票池範本", ["自訂輸入"] + list(STOCK_POOLS.keys()))
-    default_codes = ", ".join(STOCK_POOLS[pool_choice]) if pool_choice != "自訂輸入" else "2330, 2454, 2317, 2382, 2603"
-    raw_input = st.sidebar.text_area("股票代碼清單（逗號、空白、換行或全形逗號分隔）", default_codes, height=120)
-    batch_btn = st.sidebar.button("🚀 開始批次評分掃描", type="primary")
+    st.session_state.setdefault("codes_text", "2330, 2454, 2317, 2382, 2603")
+    st.sidebar.selectbox("快速選取股票池範本", ["自訂輸入"] + list(STOCK_POOLS.keys()), key="pool_choice", on_change=apply_pool)
+    recents = st.session_state.get("recent_lists", [])
+    if recents:
+        st.sidebar.selectbox(
+            "最近輸入（本次連線最近 5 次）", ["—"] + recents, key="recent_choice", on_change=apply_recent,
+            format_func=lambda s: s if s == "—" else f"{len(parse_codes(s))} 檔：{s[:22]}{'…' if len(s) > 22 else ''}",
+        )
+    raw_input = st.sidebar.text_area("股票代碼清單（逗號、空白、換行或全形逗號分隔）", key="codes_text", height=120)
+    batch_btn = st.sidebar.button("🚀 開始批次評分掃描", type="primary", on_click=remember_current)
     if "holder_weeks" in st.session_state:
         st.sidebar.caption(f"大戶持股：本機已累積 {st.session_state['holder_weeks']} 週資料（需跨 4 週才有趨勢分）")
 
-    codes = list(dict.fromkeys(c for c in re.split(r"[,\s，、;；]+", raw_input) if c))
+    codes = parse_codes(raw_input)
 
     if "batch_results" not in st.session_state:
         st.session_state["batch_results"] = {}
@@ -657,7 +856,7 @@ def main():
     ok = {c: r for c, r in results.items() if not r.get("error")}
     failed = {c: r["error"] for c, r in results.items() if r.get("error")}
 
-    tab_main, tab_bt = st.tabs(["📋 批次排行與個股診斷", "📊 評分有效性回測"])
+    tab_main, tab_scr, tab_bt = st.tabs(["📋 批次排行與個股診斷", "🔎 量價型態快篩", "📊 評分有效性回測"])
 
     with tab_main:
         if failed:
@@ -696,6 +895,9 @@ def main():
                 format_func=lambda c: f"{ok[c]['display_name']}　總分 {fmt(ok[c]['total'])}（{ok[c]['verdict']}）",
             )
             render_detail(ok[sel])
+
+    with tab_scr:
+        render_screener(codes, token, info_map)
 
     with tab_bt:
         render_backtest(ok)
