@@ -12,13 +12,21 @@
 5. 其他：股名快取失敗不再被鎖 24 小時、支援全形逗號、偵測 FinMind 限流、
    目標價分開顯示並補回風險報酬比、相容新舊版 Streamlit 的寬度參數
 
+v6 修正（依審查意見逐條查證後採納的部分）：
+8. ROE：FinMind 損益表的 EquityAttributableToOwnersOfParent 其實是「綜合損益總額歸屬母公司」，不是淨利，
+   改用 IncomeAfterTaxes ÷ 權益總額 Equity，並依季末日期對齊；兩者季度對不上就顯示 N/A，不硬算
+9. 新高改為「收盤價突破前期最高收盤」（不含當日），避免窗口少算一天
+10. 大戶持股歷史以 (日期, 代碼) 為唯一鍵合併；回測會帶入『當時已累積』的大戶歷史，與即時評分口徑一致
+11. 資料完整度 <60% 標示低可信度；目標價改以區間呈現，風險報酬比用保守目標價（區間低端）計算
+12. 回測新增「不重疊取樣」與逐年檢視；限流偵測加入 HTTP 429
+
 v5 新增：
 6. 量價型態快篩：爆量（今日量 ≥ 昨量／5日均量／60日均量的 N 倍）＋近期出現破底翻／創20日新高／創歷史新高，
    只用股價資料（每檔 1 次 API），可把通過的股票一鍵放進左側清單再做完整評分
 7. 最近 5 次輸入的清單記錄（只存在本次連線；重新整理網頁會清空）
 
 安裝：pip install streamlit pandas numpy requests plotly
-執行：streamlit run stock_batch_scorer_v5.py
+執行：streamlit run stock_batch_scorer_v6.py
 """
 import datetime as dt
 import io
@@ -54,8 +62,10 @@ LAG_REV = 40
 LAG_Q, LAG_Y = 46, 91
 
 # 損益表／資產負債表的欄位名稱候選（依序嘗試；若都對不上，到「資料診斷」查看實際欄位）
-NI_CANDS = ["EquityAttributableToOwnersOfParent", "NetIncomeAttributableToOwnersOfParent", "IncomeAfterTaxes"]
-EQ_CANDS = ["EquityAttributableToOwnersOfParent", "Equity", "TotalEquity"]
+# 注意：損益表的 EquityAttributableToOwnersOfParent 是「綜合損益總額歸屬母公司」（含其他綜合損益），不是淨利。
+# 淨利用 IncomeAfterTaxes（本期淨利，含非控制權益），搭配資產負債表的權益總額 Equity，兩者口徑一致。
+NI_CANDS = ["IncomeAfterTaxes"]
+EQ_CANDS = ["Equity", "TotalEquity"]
 
 STOCK_POOLS = {
     "台股核心權值": ["2330", "2317", "2454", "2308", "2382", "2881", "2882"],
@@ -126,7 +136,7 @@ def safe_get(key, code, token):
 
 
 def is_rate_limited(status: dict) -> bool:
-    return any(("402" in s or "limit" in s.lower()) for s in status.values() if s.startswith("失敗"))
+    return any(("402" in s or "429" in s or "limit" in s.lower()) for s in status.values() if s.startswith("失敗"))
 
 
 # ── 大戶持股（TDCC 免費開放資料，僅最新一週，自行累積歷史）──
@@ -166,16 +176,25 @@ def load_holder_history() -> pd.DataFrame:
     return pd.DataFrame(columns=["date", "stock_id", "large_pct"])
 
 
+def merge_holder_history(hist: pd.DataFrame, snap: pd.DataFrame) -> pd.DataFrame:
+    """以 (date, stock_id) 為唯一鍵合併：同一天不同股票的資料各自保留"""
+    if snap is None or snap.empty:
+        return hist
+    if hist.empty:
+        return snap.drop_duplicates(["date", "stock_id"]).reset_index(drop=True)
+    comb = pd.concat([hist, snap], ignore_index=True).drop_duplicates(["date", "stock_id"], keep="last")
+    return comb.sort_values(["date", "stock_id"]).reset_index(drop=True)
+
+
 def update_holder_history(snap: pd.DataFrame) -> pd.DataFrame:
     hist = load_holder_history()
-    new = snap[~snap["date"].isin(hist["date"])] if not snap.empty else snap
-    if not new.empty:
-        hist = pd.concat([hist, new], ignore_index=True).drop_duplicates(["date", "stock_id"])
+    comb = merge_holder_history(hist, snap)
+    if len(comb) > len(hist):
         try:
-            hist.to_csv(HOLDER_FILE, index=False)
+            comb.to_csv(HOLDER_FILE, index=False)
         except OSError:
             pass  # 雲端環境檔案系統可能唯讀／重啟即清空
-    return hist
+    return comb
 
 
 # ───────────────────────── 工具函式 ─────────────────────────
@@ -237,6 +256,28 @@ def cut(df, t):
 
 
 # ───────────────────────── 基本面評分 ─────────────────────────
+def calc_roe(fin, bs):
+    """ROE(%) = 近四季本期淨利 ÷ 近五個季末權益平均。淨利與權益依『季末日期』對齊；對不上就回傳 None"""
+    if fin is None or fin.empty or bs is None or bs.empty:
+        return None, "資料不足"
+    ni_col = next((c for c in NI_CANDS if c in fin and fin[c].notna().sum() >= 4), None)
+    eq_col = next((c for c in EQ_CANDS if c in bs and bs[c].notna().sum() >= 5), None)
+    if not ni_col or not eq_col:
+        return None, "資料不足（找不到淨利或權益欄位，見資料診斷）"
+    ni, eq = fin[ni_col].dropna(), bs[eq_col].dropna()
+    last4 = list(ni.index[-4:])
+    if (pd.to_datetime(last4[-1]) - pd.to_datetime(last4[0])).days > 300:
+        return None, "資料不足（近四季財報季度不連續）"
+    if last4[-1] not in eq.index:
+        return None, "資料不足（最新一季財報與資產負債表季度未對齊）"
+    eq5 = eq[eq.index <= last4[-1]].iloc[-5:]
+    if len(eq5) < 5 or (eq5 <= 0).any():
+        return None, "資料不足（權益資料不足五季或為負）"
+    roe = float(ni.loc[last4].sum() / eq5.mean() * 100)
+    if abs(roe) > 150:
+        return None, f"異常（{roe:.0f}%），請檢查欄位與單位"
+    return roe, f"{roe:.2f}%（{ni_col} ÷ {eq_col}）"
+
 def score_fundamental(rev, fin, bs, per):
     items, eps_ttm, fair_pe = [], None, None
 
@@ -271,16 +312,10 @@ def score_fundamental(rev, fin, bs, per):
                 d = gm.iloc[-1] - gm.iloc[-5]
                 gm_s, gm_v = lin(d, -0.03, 0.03), f"{gm.iloc[-1]:.1%}（較去年同期 {d * 100:+.1f} 百分點）"
 
-        # ROE = 近四季稅後淨利 ÷ 近五季平均權益（權益來自資產負債表）
-        ni_col = next((c for c in NI_CANDS if c in fin and fin[c].notna().sum() >= 4), None)
-        eq_col = next((c for c in EQ_CANDS if bs is not None and not bs.empty and c in bs and bs[c].notna().sum() >= 1), None)
-        if ni_col and eq_col:
-            avg_eq = bs[eq_col].dropna().iloc[-5:].mean()
-            if avg_eq > 0:
-                roe = fin[ni_col].dropna().iloc[-4:].sum() / avg_eq * 100
-                roe_s, roe_v = lin(roe, 5, 20), f"{roe:.2f}%"
-        else:
-            roe_v = "資料不足（找不到淨利或權益欄位，見資料診斷）"
+        # ROE：淨利與權益依季末日期對齊（見 calc_roe）
+        roe, roe_v = calc_roe(fin, bs)
+        if roe is not None:
+            roe_s = lin(roe, 5, 20)
     items.append(("EPS 成長", eps_v, eps_s, 20))
     items.append(("毛利率趨勢", gm_v, gm_s, 15))
     items.append(("近四季 ROE", roe_v, roe_s, 20))
@@ -450,9 +485,11 @@ def calculate_stock_profile(code, name, token, holders_hist):
     s = snapshot(d, p, len(p) - 1, live=True, holders=h)
     x = p.iloc[-1]
     tg, stop = targets(p, s["eps_ttm"], s["fair_pe"])
-    mid = float(np.mean(list(tg.values())))
+    vals = list(tg.values())
+    mid = float(np.mean(vals))  # 兩種估值假設不同，平均僅供參考，不用來算風險報酬
+    low_t = float(min(vals))    # 保守目標價（區間低端）
     risk = x["close"] - stop
-    rr = (mid - x["close"]) / risk if mid > x["close"] and risk > 0 else None
+    rr = (low_t - x["close"]) / risk if low_t > x["close"] and risk > 0 else None
 
     all_rows = [r for rows in s["rows"] for r in rows]
     valid = sum(1 for r in all_rows if r["分數"] != "N/A")
@@ -461,7 +498,7 @@ def calculate_stock_profile(code, name, token, holders_hist):
         "close": x["close"], "total": s["total"],
         "f_score": s["scores"]["基本面"], "c_score": s["scores"]["籌碼面"], "t_score": s["scores"]["技術面"],
         "verdict": verdict(s["total"], s["scores"]["基本面"], x),
-        "target": mid, "stop": stop, "rr": rr, "targets_dict": tg,
+        "target": mid, "low_target": low_t, "stop": stop, "rr": rr, "targets_dict": tg,
         "valid": valid, "total_items": len(all_rows),
         "p_df": p, "rows": s["rows"], "data": d, "status": status,
         "rate_limited": is_rate_limited(status),
@@ -469,16 +506,23 @@ def calculate_stock_profile(code, name, token, holders_hist):
 
 
 # ───────────────────────── 評分有效性回測 ─────────────────────────
-def backtest_stock(res, step=5, horizons=(20, 60), start_i=130):
+def backtest_stock(res, step=5, horizons=(20, 60), start_i=130, holders_hist=None):
     """每隔 step 個交易日計算一次當時的評分，記錄『隔日收盤進場』後 20/60 日報酬"""
     d, p = res["data"], res["p_df"]
     n = len(p)
     rows = []
+    hh_all = pd.DataFrame()
+    if holders_hist is not None and not holders_hist.empty:
+        hh_all = holders_hist[holders_hist["stock_id"] == res["code"]][["date", "large_pct"]]
     for i in range(start_i, n - 1 - min(horizons), step):
-        s = snapshot(d, p, i)
+        x = p.iloc[i]
+        h = None
+        if not hh_all.empty:  # 只用當時已累積、且至少 7 天前的大戶資料，絕不回填未來資料
+            cutoff = (pd.Timestamp(x["date"]) - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+            h = hh_all[hh_all["date"] <= cutoff]
+        s = snapshot(d, p, i, holders=h)
         if s["total"] is None:
             continue
-        x = p.iloc[i]
         entry = p["close"].iloc[i + 1]
         row = {
             "代碼": res["code"], "日期": x["date"], "總分": s["total"],
@@ -587,11 +631,11 @@ def detect_patterns(p, selected, lookback=5, window=60):
         return dates.iloc[idx[-1]] if idx else None
 
     if "創20日新高" in selected:
-        d = last_true(c >= c.rolling(20).max())
+        d = last_true(c > c.shift(1).rolling(20).max())  # 收盤突破前 20 日最高收盤（不含當日）
         if d:
             found["創20日新高"] = f"創20日新高（{d[5:]}）"
     if "創歷史新高" in selected and n >= 250:  # 以抓到的約 5 年資料為準，且為未還原權值價格
-        d = last_true(c >= c.cummax())
+        d = last_true(c > c.shift(1).cummax())  # 收盤突破資料期間內所有前期最高收盤
         if d:
             found["創歷史新高"] = f"創資料期間新高（{d[5:]}）"
     if "破底翻" in selected and n > window + 10:
@@ -633,14 +677,16 @@ def render_detail(d):
     m[2].metric("籌碼面 (30%)", fmt(d["c_score"]))
     m[3].metric("技術面 (35%)", fmt(d["t_score"]))
     st.caption(f"有效指標 {d['valid']}/{d['total_items']}（N/A 的指標會自動排除並重新配權）")
+    if d["valid"] / d["total_items"] < 0.6:
+        st.warning("⚠️ 有效指標不足 60%，總分可信度低，請勿與資料完整的股票直接比較。")
 
     tg = d["targets_dict"]
     vals = list(tg.values())
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("目標價區間", f"{min(vals):.1f}–{max(vals):.1f}")
-    c2.metric("目標價平均", f"{d['target']:.1f}", f"{(d['target'] / x['close'] - 1) * 100:+.1f}%")
+    c2.metric("保守目標價（低端）", f"{d['low_target']:.1f}", f"{(d['low_target'] / x['close'] - 1) * 100:+.1f}%")
     c3.metric("停損參考", f"{d['stop']:.1f}", f"{(d['stop'] / x['close'] - 1) * 100:+.1f}%")
-    c4.metric("風險報酬比", "—" if d["rr"] is None else f"{d['rr']:.1f}")
+    c4.metric("風險報酬比（保守目標）", "—" if d["rr"] is None else f"{d['rr']:.1f}")
     for k, v in tg.items():
         st.caption(f"{k}：{v:.1f}")
 
@@ -680,7 +726,7 @@ def render_backtest(ok_results):
     if st.button("執行回測"):
         frames, bar = [], st.progress(0)
         for k, code in enumerate(codes):
-            frames.append(backtest_stock(ok_results[code]))
+            frames.append(backtest_stock(ok_results[code], holders_hist=st.session_state.get("holder_hist")))
             bar.progress((k + 1) / len(codes))
         bar.empty()
         st.session_state["bt_df"] = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -695,6 +741,10 @@ def render_backtest(ok_results):
         bt = bt[bt["代碼"] == scope]
     col = f"ret{h}"
     sub = bt.dropna(subset=[col]).copy()
+    if st.checkbox("不重疊取樣（每檔每隔持有期取一次：樣本較少，但彼此較獨立）", value=False):
+        k = max(1, h // 5)
+        sub = sub.sort_values(["代碼", "日期"])
+        sub = sub[sub.groupby("代碼").cumcount() % k == 0]
     if len(sub) < 30:
         st.warning(f"可用樣本只有 {len(sub)} 筆，統計意義有限。")
         if sub.empty:
@@ -718,12 +768,27 @@ def render_backtest(ok_results):
     fig.update_layout(height=280, yaxis_title=f"平均{h}日報酬(%)", margin=dict(l=0, r=0, t=10, b=0))
     st.plotly_chart(fig, **STRETCH)
 
+    st.markdown("**逐年檢視**（看是否只在特定年份有效）")
+    sub["年"] = sub["日期"].str[:4]
+    yr = []
+    for y, g in sub.groupby("年"):
+        hi, lo = g.loc[g["分組"] == "高分組", col].mean(), g.loc[g["分組"] == "低分組", col].mean()
+        yr.append({
+            "年": y, "樣本數": len(g),
+            "IC": g["總分"].rank().corr(g[col].rank()) if len(g) >= 10 else np.nan,
+            "高分組−低分組": hi - lo if pd.notna(hi) and pd.notna(lo) else np.nan,
+        })
+    yd = pd.DataFrame(yr)
+    yd["IC"] = yd["IC"].map(lambda v: "—" if pd.isna(v) else f"{v:+.3f}")
+    yd["高分組−低分組"] = yd["高分組−低分組"].map(lambda v: "—" if pd.isna(v) else f"{v:+.2%}")
+    st.dataframe(yd, hide_index=True, **STRETCH)
+
     st.markdown("**依買點判斷分組**")
     show_table(group_table(sub, "判斷", col, base))
     st.caption(
         "解讀提醒：①取樣間隔 5 天而持有 20/60 天，樣本彼此重疊，實際有效樣本比顯示的少；"
         "②標的只限你掃描的股票，且是現存股票（有存活者偏差）；③未計手續費與稅；"
-        "④回測期間沒有大戶持股歷史，籌碼面僅含法人與融資；⑤權重與門檻若依這份結果反覆調整，會變成過度配適，"
+        "④大戶持股只在『已累積歷史』的期間才計入，更早的期間籌碼面僅含法人與融資；⑤權重與門檻若依這份結果反覆調整，會變成過度配適，"
         "建議保留最近一段期間不參與調參，另做驗證。"
     )
 
@@ -732,7 +797,7 @@ def render_screener(codes, token, info_map):
     st.subheader("🔎 量價型態快篩")
     st.caption(
         "只用股價資料（每檔 1 次 API），從左側清單中篩出「爆量 ＋ 近期出現指定型態」的股票。"
-        "量能基準皆不含當日；型態以收盤價判斷。『歷史新高』以抓到的約 5 年資料為準，價格未還原除權息。"
+        "量能基準皆不含當日；型態以收盤價判斷。新高＝收盤價突破前期最高收盤（不含當日）；『歷史新高』以抓到的約 5 年資料為準，價格未還原除權息。"
     )
     c1, c2 = st.columns(2)
     bases = c1.multiselect("量能基準（任一成立）", VOL_BASES, default=VOL_BASES)
@@ -834,6 +899,7 @@ def main():
             hist = load_holder_history()
             st.sidebar.warning(f"TDCC 大戶資料下載失敗：{str(e)[:60]}")
         st.session_state["holder_weeks"] = hist["date"].nunique()
+        st.session_state["holder_hist"] = hist
 
         bar, box = st.progress(0), st.empty()
         for idx, code in enumerate(codes):
@@ -866,12 +932,14 @@ def main():
         else:
             rows = []
             for c, r in ok.items():
-                up = (r["target"] / r["close"] - 1) * 100
+                up = (r["low_target"] / r["close"] - 1) * 100
+                cov = r["valid"] / r["total_items"]
                 rows.append({
                     "代碼": r["code"], "股名": r["name"] or "—", "現價": r["close"],
                     "總分": r["total"], "基本面": r["f_score"], "籌碼面": r["c_score"], "技術面": r["t_score"],
-                    "有效指標": f"{r['valid']}/{r['total_items']}", "目標價": r["target"],
-                    "潛在空間": f"{up:+.1f}%", "風險報酬": r["rr"], "買點訊號": r["verdict"],
+                    "有效指標": f"{r['valid']}/{r['total_items']}", "可信度": "高" if cov >= 0.8 else "中" if cov >= 0.6 else "⚠低",
+                    "保守目標價": r["low_target"],
+                    "保守空間": f"{up:+.1f}%", "風險報酬": r["rr"], "買點訊號": r["verdict"],
                 })
             sdf = pd.DataFrame(rows).sort_values("總分", ascending=False, na_position="last").reset_index(drop=True)
             st.subheader("📋 批次評分排行榜（依總分排序）")
@@ -884,7 +952,7 @@ def main():
                     "基本面": st.column_config.NumberColumn(format="%.0f"),
                     "籌碼面": st.column_config.NumberColumn(format="%.0f"),
                     "技術面": st.column_config.NumberColumn(format="%.0f"),
-                    "目標價": st.column_config.NumberColumn(format="%.1f"),
+                    "保守目標價": st.column_config.NumberColumn(format="%.1f"),
                     "風險報酬": st.column_config.NumberColumn(format="%.1f"),
                 },
             )
