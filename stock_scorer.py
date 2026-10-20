@@ -1,13 +1,13 @@
 """
-個股多面向評分、買點精準決策與停利停損系統（台股實戰量化版 V4，Streamlit）
-新增核心功能：
-1. 買入決策五維度檢查表（風報比、乖離率、量價結構、籌碼共振、歷史期望值）
-2. 三階段停利價位（TP1 前高保守、TP2 均值合理、TP3 樂觀延伸）與多重停損防線
-3. 凱利公式期望值（Expected Value）與單筆部位風控計算機（自動算出建議買進股數）
-4. K 線圖直接繪製 TP1/TP2/建議買入區間/停損線，視覺化呈現交易計畫
+個股多面向評分、買點精準決策與停利停損系統（台股實戰量化版 V5，Streamlit）
+新增亮點：
+1. 排行榜支援「點擊表格列直接切換個股（Interactive Row Selection）」，免除下拉選單二次查找
+2. 買入決策五維度檢查表（風報比、乖離率、量價結構、籌碼共振、綜合得分）
+3. 三階段停利價位（TP1 保守、TP2 合理、TP3 樂觀）與多重停損防線
+4. 單筆部位風控計算機與 K 線視覺化交易計畫
 
-安裝：pip install streamlit pandas numpy requests plotly
-執行：streamlit run stock_batch_scorer_v4.py
+安裝/升級：pip install -U streamlit pandas numpy requests plotly
+執行：streamlit run stock_batch_scorer_v5.py
 """
 import datetime as dt
 import time
@@ -85,7 +85,6 @@ def combine(items):
 def score_fundamental(rev, fin, per):
     items, eps_ttm, fair_pe, high_pe = [], None, None, None
 
-    # 1. 營收年增率
     s, v = None, "資料不足"
     if len(rev) >= 15:
         r = rev.sort_values("date")["revenue"].astype(float).values
@@ -95,7 +94,6 @@ def score_fundamental(rev, fin, per):
             s, v = lin(yoy, -0.10, 0.30), f"{yoy:+.1%}"
     items.append(("近3月營收年增", v, s, 20))
 
-    # 2. EPS、毛利、ROE
     eps_s, eps_v = None, "資料不足"
     gm_s, gm_v = None, "資料不足"
     roe_s, roe_v = None, "資料不足"
@@ -138,7 +136,6 @@ def score_fundamental(rev, fin, per):
     items.append(("毛利率趨勢", gm_v, gm_s, 15))
     items.append(("近四季 ROE", roe_v, roe_s, 20))
 
-    # 3. 本益比與殖利率
     pe_s, pe_v, dy_s, dy_v = None, "資料不足", None, "資料不足"
     if not per.empty:
         per = per.sort_values("date")
@@ -295,13 +292,12 @@ def evaluate_trade_plan(p, total, f_score, c_score, t_score, eps_ttm, fair_pe, h
 
     # 1. 多重停損位計算
     atr_stop = c - 2.0 * atr
-    swing_low_20 = float(p["min"].tail(20).min()) * 0.99  # 近20日箱型低點往下1%避免假跌破
-    ma60_stop = ma60 * 0.985  # 季線下1.5%
+    swing_low_20 = float(p["min"].tail(20).min()) * 0.99
+    ma60_stop = ma60 * 0.985
 
-    # 實戰建議停損：在現價下方的前提下，取較高者以控制單筆最大虧損（不超過 -10%）
     candidate_stops = [s for s in [atr_stop, swing_low_20, ma60_stop] if s < c * 0.99]
     rec_stop = max(candidate_stops) if candidate_stops else atr_stop
-    rec_stop = max(rec_stop, c * 0.90)  # 硬性底線：單筆最多忍受 10% 停損
+    rec_stop = max(rec_stop, c * 0.90)
 
     stop_details = {
         "波動率停損 (現價 - 2×ATR)": round(atr_stop, 2),
@@ -315,354 +311,5 @@ def evaluate_trade_plan(p, total, f_score, c_score, t_score, eps_ttm, fair_pe, h
     hi_120 = float(p["max"].tail(120).max())
     lo_120 = float(p["min"].tail(120).min())
 
-    # TP1 (保守/前高或布林上軌)
     tp1_candidates = [v for v in [hi_60, bb_up] if v > c * 1.02]
-    tp1 = min(tp1_candidates) if tp1_candidates else c + 2.0 * atr
-
-    # TP2 (合理估值 / 1.272 延伸)
-    fib_1272 = lo_120 + (hi_120 - lo_120) * 1.272
-    pe_target_fair = (eps_ttm * fair_pe) if (eps_ttm and eps_ttm > 0 and fair_pe) else fib_1272
-    tp2_raw = float(np.mean([fib_1272, pe_target_fair]))
-    tp2 = max(tp2_raw, tp1 * 1.04)  # 確保 TP2 高於 TP1
-
-    # TP3 (樂觀噴出 / 1.618 延伸 / 本益比75分位)
-    fib_1618 = lo_120 + (hi_120 - lo_120) * 1.618
-    pe_target_high = (eps_ttm * high_pe) if (eps_ttm and eps_ttm > 0 and high_pe) else fib_1618
-    tp3_raw = float(np.mean([fib_1618, pe_target_high]))
-    tp3 = max(tp3_raw, tp2 * 1.06)
-
-    # 3. 計算風報比與理想買入區間 (Buy Zone)
-    risk = max(c - rec_stop, 0.01)
-    reward_tp2 = max(tp2 - c, 0)
-    rr_ratio = reward_tp2 / risk
-
-    # 理想買入區間：若乖離過大，建議等拉回 MA10 ~ MA20 之間
-    bias_20 = (c / ma20 - 1) * 100
-    buy_zone_low = round(min(ma20, c - 0.8 * atr), 2)
-    buy_zone_high = round(min(c, ma10 * 1.01), 2) if bias_20 > 5 else round(c * 1.005, 2)
-
-    # 4. 進場五維度檢核表 (Entry Checklist)
-    bt_20 = run_backtest(p, buy_threshold=70, hold_days=20)
-    win_rate_20 = (bt_20["持有20日報酬(%)"] > 0).mean() * 100 if not bt_20.empty else 50.0
-    avg_win = bt_20[bt_20["持有20日報酬(%)"] > 0]["持有20日報酬(%)"].mean() if not bt_20.empty else 5.0
-    avg_loss = abs(bt_20[bt_20["持有20日報酬(%)"] <= 0]["持有20日報酬(%)"].mean()) if not bt_20.empty else 5.0
-
-    # 量價配合檢查：近5日上漲日平均量 > 下跌日平均量 或 量縮回測支撐
-    last5 = p.tail(5)
-    up_vol = last5[last5["close"] >= last5["open"]]["Trading_Volume"].mean()
-    dn_vol = last5[last5["close"] < last5["open"]]["Trading_Volume"].mean()
-    vol_healthy = (pd.isna(dn_vol)) or (up_vol > dn_vol) or (x["Trading_Volume"] < x["vol_ma20"] and c >= ma20)
-
-    checklist = [
-        {
-            "檢核項目": "1. 綜合基本與趨勢評分",
-            "狀態": "✅ 通過" if (total and total >= 65) else "⚠️ 偏弱",
-            "當前數值": f"總分 {total:.0f} 分 (基本面 {f_score or 0:.0f} / 技術面 {t_score or 0:.0f})",
-            "判斷標準": "總分 ≥ 65 分代表多面向具備優勢",
-            "pass": bool(total and total >= 65),
-        },
-        {
-            "檢核項目": "2. 風險報酬比 (以 TP2 計算)",
-            "狀態": "✅ 通過" if rr_ratio >= 1.5 else "⚠️ 不佳",
-            "當前數值": f"1 : {rr_ratio:.2f} (潛在獲利 +{reward_tp2/c*100:.1f}% / 停損風險 -{risk/c*100:.1f}%)",
-            "判斷標準": "風報比 ≥ 1.5 倍才具備出手價值",
-            "pass": bool(rr_ratio >= 1.5),
-        },
-        {
-            "檢核項目": "3. 均線乖離與追高風險",
-            "狀態": "✅ 通過" if (-2 <= bias_20 <= 7 and x["rsi"] <= 72) else "⚠️ 過熱或破線",
-            "當前數值": f"月線乖離 {bias_20:+.1f}%，RSI 為 {x['rsi']:.0f}",
-            "判斷標準": "月線乖離介於 -2% ~ +7% 且 RSI ≤ 72 不追高",
-            "pass": bool(-2 <= bias_20 <= 7 and x["rsi"] <= 72),
-        },
-        {
-            "檢核項目": "4. 籌碼面主力動向",
-            "狀態": "✅ 通過" if (c_score and c_score >= 55) else "⚠️ 籌碼渙散",
-            "當前數值": f"籌碼得分 {c_score or 0:.0f} 分",
-            "判斷標準": "籌碼分 ≥ 55 代表法人或大戶偏多操作",
-            "pass": bool(c_score and c_score >= 55),
-        },
-        {
-            "檢核項目": "5. 短期量價結構",
-            "狀態": "✅ 通過" if vol_healthy else "⚠️ 出貨疑慮",
-            "當前數值": "價漲量增 / 量縮守支撐" if vol_healthy else "下跌出量或高檔爆量收黑",
-            "判斷標準": "攻擊時有量、拉回時量縮",
-            "pass": bool(vol_healthy),
-        },
-    ]
-
-    pass_count = sum(1 for item in checklist if item["pass"])
-
-    # 最終綜合行動決策
-    if pass_count == 5:
-        action = "🟢 強烈建議買進（五維度全數過關，風報比極佳）"
-        action_level = "success"
-    elif pass_count == 4 and rr_ratio >= 1.3:
-        action = "🟢 適合分批買進（多數條件符合，可先建基本倉）"
-        action_level = "success"
-    elif (total and total >= 70) and (bias_20 > 7 or rr_ratio < 1.3):
-        action = f"🟡 標的優質但現價過高（建議掛單等待拉回 {buy_zone_low}～{buy_zone_high} 元再買）"
-        action_level = "warning"
-    elif pass_count >= 3:
-        action = "🟡 條件好壞參半，建議小部位試單或觀望"
-        action_level = "warning"
-    else:
-        action = "🔴 不建議此時買入（風報比不佳或趨勢偏空，宜避開）"
-        action_level = "error"
-
-    return {
-        "action": action,
-        "action_level": action_level,
-        "pass_count": pass_count,
-        "checklist": checklist,
-        "rec_stop": round(rec_stop, 2),
-        "stop_pct": round((rec_stop / c - 1) * 100, 2),
-        "stop_details": stop_details,
-        "tp1": round(tp1, 2),
-        "tp2": round(tp2, 2),
-        "tp3": round(tp3, 2),
-        "rr_ratio": round(rr_ratio, 2),
-        "buy_zone": (buy_zone_low, buy_zone_high),
-        "win_rate_20": win_rate_20,
-        "avg_win": avg_win if not pd.isna(avg_win) else 5.0,
-        "avg_loss": avg_loss if (not pd.isna(avg_loss) and avg_loss > 0) else 5.0,
-    }
-
-
-# ───────────────────────── 單股分析計算打包 ─────────────────────────
-def calculate_stock_profile(code, stock_name, token):
-    price = get_dataset_safe("TaiwanStockPrice", code, 550, token)
-    if len(price) < 80:
-        return None
-
-    rev = get_dataset_safe("TaiwanStockMonthRevenue", code, 850, token)
-    fin = get_dataset_safe("TaiwanStockFinancialStatements", code, 1400, token)
-    per = get_dataset_safe("TaiwanStockPER", code, 1100, token)
-    inst = get_dataset_safe("TaiwanStockInstitutionalInvestorsBuySell", code, 60, token)
-    margin = get_dataset_safe("TaiwanStockMarginPurchaseShortSale", code, 90, token)
-    shareholding = get_dataset_safe("TaiwanStockShareholding", code, 180, token)
-
-    p = add_indicators(price)
-    x = p.iloc[-1]
-    f_score, f_rows, eps_ttm, fair_pe, high_pe = score_fundamental(rev, fin, per)
-    c_score, c_rows = score_chip(inst, margin, shareholding, price)
-    t_score, t_rows = score_technical(p)
-    scores = {"基本面": f_score, "籌碼面": c_score, "技術面": t_score}
-    total, _ = combine([(k, "", s, W_DIM[k]) for k, s in scores.items()])
-
-    plan = evaluate_trade_plan(p, total, f_score, c_score, t_score, eps_ttm, fair_pe, high_pe)
-
-    return {
-        "code": code,
-        "name": stock_name,
-        "display_name": f"{code} {stock_name}".strip(),
-        "close": float(x["close"]),
-        "total": round(total) if total else 0,
-        "f_score": round(f_score) if f_score else 0,
-        "c_score": round(c_score) if c_score else 0,
-        "t_score": round(t_score) if t_score else 0,
-        "plan": plan,
-        "p_df": p,
-        "f_rows": f_rows,
-        "c_rows": c_rows,
-        "t_rows": t_rows,
-    }
-
-
-# ───────────────────────── 畫面呈現 ─────────────────────────
-def main():
-    st.set_page_config(page_title="台股量化買點決策與部位系統", page_icon="📈", layout="wide")
-    st.title("📈 台股多面向批次評分、買點檢核與停利停損系統")
-
-    token = st.sidebar.text_input("FinMind Token（選填，填入提高限額）", type="password")
-    info_map = fetch_stock_info(token)
-
-    pool_choice = st.sidebar.selectbox("快速選取股票池範本", ["自訂輸入"] + list(STOCK_POOLS.keys()))
-    default_codes = ", ".join(STOCK_POOLS[pool_choice]) if pool_choice != "自訂輸入" else "2330, 2454, 2317, 2382, 2603"
-    raw_input = st.sidebar.text_area("股票代碼清單（逗號、空白或換行分隔）", default_codes, height=100)
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("💰 資金與風控參數設定")
-    capital = st.sidebar.number_input("預計投入總本金（萬元）", min_value=5.0, max_value=10000.0, value=100.0, step=10.0)
-    risk_pct = st.sidebar.slider("單筆交易最大可承受總本金虧損 (%)", 0.5, 5.0, 2.0, 0.5)
-
-    batch_btn = st.sidebar.button("🚀 開始批次評分與買點掃描", type="primary")
-
-    codes = [c.strip() for c in raw_input.replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
-    codes = list(dict.fromkeys(codes))
-
-    if "batch_results" not in st.session_state:
-        st.session_state["batch_results"] = {}
-
-    if batch_btn and codes:
-        st.session_state["batch_results"] = {}
-        progress_bar = st.progress(0)
-        status_box = st.empty()
-
-        for idx, code in enumerate(codes):
-            s_name = info_map.get(code, "")
-            status_box.text(f"正在掃描分析：{code} {s_name} ({idx+1}/{len(codes)}) ...")
-            try:
-                res = calculate_stock_profile(code, s_name, token)
-                if res:
-                    st.session_state["batch_results"][code] = res
-            except Exception as e:
-                st.warning(f"標的 {code} 擷取失敗：{e}")
-            progress_bar.progress((idx + 1) / len(codes))
-            if not token:
-                time.sleep(0.3)
-
-        status_box.success("批次掃描完成！")
-        progress_bar.empty()
-
-    results = st.session_state["batch_results"]
-
-    if results:
-        summary_rows = []
-        for c, data in results.items():
-            pl = data["plan"]
-            upside_tp2 = (pl["tp2"] / data["close"] - 1) * 100
-            summary_rows.append({
-                "代碼": data["code"],
-                "股名": data["name"] if data["name"] else "—",
-                "現價": data["close"],
-                "總分": data["total"],
-                "檢核通過": f"{pl['pass_count']} / 5 項",
-                "風報比": pl["rr_ratio"],
-                "停損價": f"{pl['rec_stop']} ({pl['stop_pct']:+.1f}%)",
-                "合理停利(TP2)": f"{pl['tp2']} ({upside_tp2:+.1f}%)",
-                "操作建議": pl["action"].split("（")[0],
-            })
-
-        summary_df = pd.DataFrame(summary_rows).sort_values(["總分", "風報比"], ascending=[False, False]).reset_index(drop=True)
-
-        st.subheader("📋 批次評分與風報比排行榜")
-        st.caption("優先挑選『檢核通過 ≥ 4 項』且『風報比 ≥ 1.5』之標的，再於下方查看分批停利與部位配置建議。")
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-        st.write("---")
-        st.subheader("🎯 個股交易計畫、買點檢核與停利停損配置")
-
-        selected_code = st.selectbox(
-            "選擇要制定交易計畫的個股：",
-            options=summary_df["代碼"].tolist(),
-            format_func=lambda x: f"{results[x]['display_name']} ｜ 總分 {results[x]['total']} ｜ 風報比 {results[x]['plan']['rr_ratio']} ｜ {results[x]['plan']['action'].split('（')[0]}"
-        )
-
-        if selected_code and selected_code in results:
-            d = results[selected_code]
-            pl = d["plan"]
-            p = d["p_df"]
-            cur_p = d["close"]
-
-            # 標題與綜合決策橫幅
-            st.markdown(f"### 🏢 {d['display_name']}　最新收盤價：**{cur_p:.2f} 元**")
-            getattr(st, pl["action_level"])(f"**買入評估結論：{pl['action']}**")
-
-            # 核心評分指標
-            m0, m1, m2, m3, m4 = st.columns(5)
-            m0.metric("綜合總分", f"{d['total']} 分")
-            m1.metric("基本面 (35%)", f"{d['f_score']} 分")
-            m2.metric("籌碼面 (30%)", f"{d['c_score']} 分")
-            m3.metric("技術面 (35%)", f"{d['t_score']} 分")
-            m4.metric("檢核表通過數", f"{pl['pass_count']} / 5 項")
-
-            # ─────── 區塊 1：三階停利與停損價位卡 ───────
-            st.markdown("#### 📌 實戰價位規劃（建議買入區、三段式停利、防守停損）")
-            p1, p2, p3, p4, p5 = st.columns(5)
-            bz_lo, bz_hi = pl["buy_zone"]
-            p1.metric("理想買入區間", f"{bz_lo} ~ {bz_hi}", "拉回分批承接")
-            p2.metric("🛑 建議停損價", f"{pl['rec_stop']} 元", f"{pl['stop_pct']:+.1f}%", delta_color="inverse")
-            p3.metric("🎯 第一停利 (TP1)", f"{pl['tp1']} 元", f"{(pl['tp1']/cur_p - 1)*100:+.1f}% (先出1/3)")
-            p4.metric("🎯 第二停利 (TP2)", f"{pl['tp2']} 元", f"{(pl['tp2']/cur_p - 1)*100:+.1f}% (再出1/3)")
-            p5.metric("🚀 樂觀停利 (TP3)", f"{pl['tp3']} 元", f"{(pl['tp3']/cur_p - 1)*100:+.1f}% (移動停利)")
-
-            # ─────── 區塊 2：資金控管與部位計算機 ───────
-            max_loss_ntd = capital * 10000 * (risk_pct / 100.0)
-            loss_per_share = max(cur_p - pl["rec_stop"], 0.1)
-            suggested_shares = int(max_loss_ntd // loss_per_share)
-            # 同時不得超過總本金可買股數
-            max_affordable_shares = int((capital * 10000) // cur_p)
-            final_shares = min(suggested_shares, max_affordable_shares)
-            position_value = final_shares * cur_p
-            position_weight = (position_value / (capital * 10000)) * 100
-
-            with st.expander("⚖️ 單筆風險部位試算與停損防線細節（點擊展開）", expanded=True):
-                rc1, rc2 = st.columns([1.2, 1])
-                with rc1:
-                    st.markdown("**💡 資金控管建議（固定風險比例法）**")
-                    st.write(
-                        f"- 您的總本金為 **{capital:.0f} 萬元**，設定單筆最大容忍虧損 **{risk_pct:.1f}%**（即最多賠 **{max_loss_ntd:,.0f} 元**）。\n"
-                        f"- 若於現價 **{cur_p} 元** 買進，跌破 **{pl['rec_stop']} 元** 停損，每股風險為 **{loss_per_share:.2f} 元**。\n"
-                        f"- **建議買進部位**：約 **{final_shares:,} 股**（約 **{final_shares/1000:.2f} 張**），"
-                        f"投入金額約 **{position_value/10000:.1f} 萬元**（佔總資金 **{position_weight:.1f}%**）。"
-                    )
-                with rc2:
-                    st.markdown("**🛡️ 各類停損防線參考價位**")
-                    for k_stop, v_stop in pl["stop_details"].items():
-                        diff_s = (v_stop / cur_p - 1) * 100
-                        st.caption(f"• {k_stop}：**{v_stop} 元** ({diff_s:+.1f}%)")
-
-            # ─────── 區塊 3：分頁明細與視覺化交易計畫圖 ───────
-            t0, t1, t2, t3, t4, t5 = st.tabs([
-                "✅ 買入五維度檢核", "📈 K線與停利停損圖", "基本面明細", "籌碼面明細", "技術面明細", "🎯 歷史勝率回測"
-            ])
-
-            with t0:
-                chk_df = pd.DataFrame(pl["checklist"]).drop(columns=["pass"])
-                st.dataframe(chk_df, hide_index=True, use_container_width=True)
-
-            with t1:
-                q = p.tail(150)
-                dates = pd.to_datetime(q["date"])
-                fig = go.Figure(go.Candlestick(
-                    x=dates, open=q["open"], high=q["max"], low=q["min"], close=q["close"], name="K線"
-                ))
-                fig.add_scatter(x=dates, y=q["ma20"], name="20MA (月線)", line=dict(color="orange", width=1.5))
-                fig.add_scatter(x=dates, y=q["ma60"], name="60MA (季線)", line=dict(color="royalblue", width=1.5))
-
-                # 標示停損與停利水平線
-                fig.add_hline(y=pl["rec_stop"], line_dash="dash", line_color="red",
-                              annotation_text=f"停損價 {pl['rec_stop']}", annotation_position="bottom right")
-                fig.add_hline(y=pl["tp1"], line_dash="dot", line_color="seagreen",
-                              annotation_text=f"TP1 保守停利 {pl['tp1']}", annotation_position="top right")
-                fig.add_hline(y=pl["tp2"], line_dash="dash", line_color="green",
-                              annotation_text=f"TP2 合理停利 {pl['tp2']}", annotation_position="top right")
-                # 標示理想買入區間帶
-                fig.add_hrect(y0=bz_lo, y1=bz_hi, fillcolor="lightgreen", opacity=0.15, line_width=0,
-                              annotation_text="建議承接區", annotation_position="bottom left")
-
-                fig.update_layout(xaxis_rangeslider_visible=False, height=480, margin=dict(l=0, r=0, t=15, b=0))
-                st.plotly_chart(fig, use_container_width=True)
-
-            t2.dataframe(pd.DataFrame(d["f_rows"]), hide_index=True, use_container_width=True)
-            t3.dataframe(pd.DataFrame(d["c_rows"]), hide_index=True, use_container_width=True)
-            t4.dataframe(pd.DataFrame(d["t_rows"]), hide_index=True, use_container_width=True)
-
-            with t5:
-                st.write(f"##### {d['display_name']} 歷史進場訊號前向報酬檢驗")
-                col_b1, col_b2 = st.columns(2)
-                th = col_b1.slider("回測進場分數門檻", 60, 85, 70, 5, key=f"th_{selected_code}")
-                h_days = col_b2.selectbox("進場後持有交易日數", [10, 20, 60], index=1, key=f"hd_{selected_code}")
-
-                bt_res = run_backtest(p, buy_threshold=th, hold_days=h_days)
-                if bt_res.empty:
-                    st.info("該股票在歷史區間內未觸發符合門檻的交易訊號。")
-                else:
-                    col_name = f"持有{h_days}日報酬(%)"
-                    win_rate = (bt_res[col_name] > 0).mean() * 100
-                    avg_ret = bt_res[col_name].mean()
-                    avg_mdd = bt_res["區間最大回撤(%)"].mean()
-
-                    w1, w2, w3, w4 = st.columns(4)
-                    w1.metric("觸發次數", f"{len(bt_res)} 次")
-                    w2.metric("持有勝率", f"{win_rate:.1f}%")
-                    w3.metric("平均報酬率", f"{avg_ret:+.2f}%")
-                    w4.metric("平均持倉最大回撤", f"{avg_mdd:.2f}%")
-                    st.dataframe(bt_res, hide_index=True, use_container_width=True)
-    else:
-        st.info("👈 請在左側設定本金與風險參數，並點擊『🚀 開始批次評分與買點掃描』。")
-
-
-if __name__ == "__main__":
-    main()
+    tp1 = min(tp1_candidates) if tp1_candidates else
