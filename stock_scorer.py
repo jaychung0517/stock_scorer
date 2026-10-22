@@ -561,40 +561,53 @@ def main():
             st.session_state["selected_code"] = summary_df.iloc[0]["代碼"]
 
         st.subheader("📋 批次評分與風報比排行榜")
-        st.caption("點選「代碼」或「股名」按鈕，下方會直接切換成該股的完整交易計畫（目前選取者以實心色塊標示）。")
+        st.caption("點選個股按鈕（代碼＋股名），下方會直接切換成該股的完整交易計畫；停損、停利、三面向分數請看下方詳情。")
 
-        cols_def = [
-            ("代碼", 1.1), ("股名", 1.6), ("現價", 0.9), ("總分", 0.7),
-            ("基/籌/技", 1.3), ("檢核", 0.9), ("風報比", 0.8),
-            ("停損價", 1.6), ("合理停利(TP2)", 1.8), ("操作建議", 2.4),
-        ]
+        def short_action(text):
+            for key, label in [
+                ("強烈建議買進", "🟢 強烈買進"),
+                ("適合分批買進", "🟢 分批買進"),
+                ("標的優質但現價過高", "🟡 等拉回"),
+                ("條件好壞參半", "🟡 觀望/試單"),
+                ("不建議此時買入", "🔴 避開"),
+            ]:
+                if key in text:
+                    return label
+            return text.split("（")[0]
+
+        cols_def = [("個股", 2.6), ("現價", 1.3), ("總分", 0.8), ("檢核", 0.8), ("風報比", 1.0), ("建議", 2.0)]
         widths = [w for _, w in cols_def]
 
-        hdr = st.columns(widths)
+        def make_cols():
+            try:
+                return st.columns(widths, vertical_alignment="center")
+            except TypeError:  # 舊版 Streamlit 不支援垂直置中
+                return st.columns(widths)
+
+        def cell(col, text, bold=False):
+            t = f"<b>{text}</b>" if bold else text
+            col.markdown(f"<div style='white-space:nowrap'>{t}</div>", unsafe_allow_html=True)
+
+        hdr = make_cols()
         for h, (name, _) in zip(hdr, cols_def):
-            h.markdown(f"**{name}**")
+            cell(h, name, bold=True)
 
         for _, r in summary_df.iterrows():
             code = r["代碼"]
+            pl_r = results[code]["plan"]
+            label = f"{code} {r['股名']}" if r["股名"] != "—" else str(code)
             is_sel = code == st.session_state["selected_code"]
-            btn_type = "primary" if is_sel else "secondary"
-            rc = st.columns(widths)
+            rc = make_cols()
 
-            if rc[0].button(str(code), key=f"pick_code_{code}", type=btn_type):
-                st.session_state["selected_code"] = code
-                st.rerun()
-            if rc[1].button(str(r["股名"]), key=f"pick_name_{code}", type=btn_type):
+            if rc[0].button(label, key=f"pick_{code}", type="primary" if is_sel else "secondary"):
                 st.session_state["selected_code"] = code
                 st.rerun()
 
-            rc[2].write(r["現價"])
-            rc[3].write(r["總分"])
-            rc[4].write(f"{r['基本面']}/{r['籌碼面']}/{r['技術面']}")
-            rc[5].write(r["檢核通過"])
-            rc[6].write(r["風報比"])
-            rc[7].write(r["停損價"])
-            rc[8].write(r["合理停利(TP2)"])
-            rc[9].write(r["操作建議"])
+            cell(rc[1], f"{r['現價']:,.2f}")
+            cell(rc[2], f"{r['總分']}")
+            cell(rc[3], f"{pl_r['pass_count']}/5")
+            cell(rc[4], f"{r['風報比']:.2f}")
+            cell(rc[5], short_action(pl_r["action"]))
 
         selected_code = st.session_state["selected_code"]
         st.write("---")
